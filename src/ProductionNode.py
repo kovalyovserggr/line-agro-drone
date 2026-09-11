@@ -75,7 +75,19 @@ class ProductionNode:
         return self.reserved.get(res_name,0) 
     
     def get_produced(self, res_name: str) -> int:
-        return self.producedget.get(res_name,0) 
+        """D11: раніше зверталось до неіснуючого self.producedget (одруківка,
+        ніколи не викликалось — тому мовчки не падало). Виправлено на self.produced —
+        реальний лічильник завершеного виробництва (інкрементується лише в
+        ProductionOperation.create_resource(), на відміну від self.reserved,
+        який рахує ЗАМОВЛЕНЕ і ніколи не зменшується)."""
+        return self.produced.get(res_name, 0)
+
+    def get_defects(self, res_name: str) -> int:
+        """D15: скільки одиниць цього ресурсу списано в брак — або як вихідний
+        продукт перерваної мід-флайт операції (self.defects[op.name]), або як
+        вхідна сировина, спожита такою операцією (self.defects[input_name]).
+        Див. _interrupt_to()."""
+        return self.defects.get(res_name, 0)
      
     def update_status(self):
         """Перевіряє накопичене напрацювання (self.time_work) на предмет випадкової
@@ -126,13 +138,50 @@ class ProductionNode:
         """Перериває поточну операцію (якщо є) і переводить вузол у REPAIR/MAINTENANCE.
         Перервана операція скидається в IDLE (а не лишається "підвислою" в EXECUTING),
         щоб вузол міг коректно повернутись до неї в наступному циклі IDLE.
-        ВІДОМЕ СПРОЩЕННЯ: уже спожиті на перервану операцію ресурси (op.resourses)
-        не повертаються на склад — це прийнятний, задокументований компроміс для
-        цього дослідження (перерваних циклів відносно мало порівняно з тривалістю
-        operations 3D-друку), але його варто явно зазначити в DECISIONS.md репозиторію."""
+
+        D15 (виправлення дедлоку з pilot_d14_extended.csv, 2026-09-11): раніше вже
+        спожиті на перервану операцію вхідні ресурси (op.resourses) просто зникали
+        зі складу без сліду — а жорстка квота throttle-гейту (D11/D12), розрахована
+        рівно на BOM×lim_drones без жодного запасу на брак, після цього НАЗАВЖДИ
+        забороняла виготовити заміну (і саму op.name, і кожен спожитий вхідний
+        ресурс — бо ЇХ виробники теж уже вперлися у свою квоту). Результат —
+        перманентний стопор, що НЕ лікується збільшенням --max-ticks (підтверджено
+        діагностикою tests/diag_downstream_stall.py: reserved-produced для вузлів
+        17-26 точно дорівнює кількості REPAIR-цик­лів + 1 поточний запит).
+
+        Правка за узгодженням з автором: якщо перервано САМЕ під час EXECUTING
+        (вхідні ресурси вже видані, вихідний продукт ще НЕ створено — create_resource()
+        не викликано), фіксуємо це як брак і РОЗШИРЮЄМО ліміт рівно на спожитий обсяг.
+
+        D18 (2026-09-11): початкова версія D15 нараховувала брак лише на op.name і
+        його БЕЗПОСЕРЕДНІ входи (op.input_resources) — один рівень вгору. Для
+        аварій на глибоких вузлах (Type19-22) цього замало: той-таки Type19, що
+        згорає в аварії, сам був зібраний із Type16/Type17, які, своєю чергою,
+        зібрані з Type1-15 сировини — і весь цей вкладений матеріал так само
+        втрачається, але одноrівнева компенсація його не покривала. За довгий
+        прогін (>7·10⁶с) це призводило до вичерпання сировини (напр. Type4) РАНІШЕ,
+        ніж покрито реальний сукупний брак — лінія застрягала, напр., на 8/10
+        дронів без подальшого прогресу (підтверджено tests/diag_downstream_stall.py:
+        вузли 17/18/21 чекають Type4, якого стабільно бракує на 1 од., бо Type4
+        вже "заблокований", хоча аварії відбувались і на Type19-22 теж).
+
+        Тепер беремо НАСКРІЗНИЙ BOM-слід op.name (self.planner.get_bom_footprint —
+        та сама рекурсія, що рахує resource_limits для lim_drones_made, але для
+        ОДНІЄЇ втраченої спроби) і нараховуємо брак на КОЖЕН ресурс у цьому дереві
+        (включно з самим op.name на множнику 1, і транзитивно всім, що на нього
+        пішло, аж до сировини). Для Type0/TypePL це теж спрацює, але безрезультатно —
+        вони в UNBOUNDED_RESOURCES і не перевіряються квотою (D12), тож зайва
+        компенсація там просто ніколи не використовується.
+        Якщо перервано в LETUP (вихід уже успішно створено раніше, це лише "відпочинок")
+        або IDLE (ресурси ще не видані, WAITING_FOR_RESOURCE) — втрат немає, брак не пишемо."""
         if self.current_op is not None:
-            self.current_op.progress = 0.0
-            self.current_op.state = OperationState.IDLE
+            op = self.current_op
+            if op.state == OperationState.EXECUTING:
+                footprint = self.planner.get_bom_footprint(op.name)
+                for res_name, qty in footprint.items():
+                    self.defects[res_name] = self.defects.get(res_name, 0) + qty
+            op.progress = 0.0
+            op.state = OperationState.IDLE
             self.current_op = None
         self.status = new_status
         self.progress = 0.0
@@ -219,18 +268,59 @@ class ProductionNode:
                     self.next_maintenance_threshold = None
                     self.next_failure_threshold = None
                     return
-                # 🔹 Аналізуємо всі операції, які вузол може виконувати
-                for op in self.operations:
-                    if op.state == OperationState.IDLE: 
-                        if self.planner.process_request(RequestRes(self.id, op.name, op.input_resources, op.callback), self.res_manager) :
-                            self.current_op = op
-                            self.status = NodeState.WAITING_FOR_RESOURCE  
-                            # 🔹 Лічильник замовленої продукції
-                            if op.name in self.reserved:
-                                self.reserved[op.name] += 1000 if op.name == "Type0" else 1
-                            else:
-                                self.reserved[op.name] = 1000 if op.name == "Type0" else 1 
-                            break  # запускаємо лише одну операцію за цикл
+                # D15/D16/D17 (2026-09-11): раніше тут просто йшли по self.operations
+                # У ПОРЯДКУ СПИСКУ і бралась ПЕРША, чий process_request повернув True —
+                # для вузлів парку друку (node_params2, 15 операцій Type1..Type15
+                # в одному й тому ж порядку на КОЖНОМУ з 15 вузлів) це означало, що
+                # Type1 (найперша в списку) чіплялась на себе назавжди, щойно D15
+                # почав розширювати ліміт компенсацією браку (D16 це виправив —
+                # обирали тип з мінімальним produced/required).
+                #
+                # D17: але й D16 виявився вразливим — коли перервана операція сама
+                # ж підживлює власний ліміт (Type1, найдовша операція 9047с →
+                # найчастіше зазнає REPAIR мід-флайт → сам собі розширює квоту),
+                # виникає контур без стелі: Type1/Type13 (спільний вхід ОБОХ гілок
+                # Type16 і Type17) вироблялись у рази понад реальну потребу (Type1:
+                # 3917 зроблено проти 30 номінальних — 3893 од. мертвим вантажем на
+                # складі), а дефіцитні Type4/Type5/Type9-12 не встигали накопичитись
+                # одночасно в кількості, потрібній вузлам 17/18/19/20/21 — ланцюжок
+                # збірки стояв ще довше (до 15·10⁶с — не лікується збільшенням
+                # --max-ticks). Підтверджено tests/diag_downstream_stall.py.
+                #
+                # Виправлення (за ідеєю автора — пріоритет "пізнім" операціям):
+                # замість абстрактної BOM-квоти обираємо тип за РЕАЛЬНИМ поточним
+                # попитом — сумою input_resources[op.name] по всіх pending-запитах у
+                # ResourceManager (це й є запити вузлів 17-26, оскільки саме вони
+                # споживають Type1-15) мінус те, що вже є на складі. Хто найбільше
+                # потрібен ЗАРАЗ комусь далі по лінії — того й виготовляємо. Стара
+                # квота (produced/required з урахуванням D15-браку) лишається як
+                # tie-breaker на випадок нульового попиту з обох сторін (напр. самий
+                # перший тік, поки жоден вузол 17-26 ще не встиг подати запит).
+                def _pending_demand(op):
+                    total_requested = sum(r.input_resources.get(op.name, 0) for r in self.res_manager.requests)
+                    pool = self.res_manager.resources.get(op.name)
+                    stock = pool.number() if pool is not None else 0
+                    return max(0.0, total_requested - stock)
+
+                def _quota_ratio(op):
+                    required = (self.planner.resource_limits.get(op.name, 0) * self.planner.limit_drones
+                                + self.planner.get_defects(op.name))
+                    if required <= 0:
+                        return float("inf")  # немає квоти на цей тип — не пріоритетний
+                    return self.planner.get_produced(op.name) / required
+
+                candidates = [op for op in self.operations if op.state == OperationState.IDLE]
+                candidates.sort(key=lambda op: (-_pending_demand(op), _quota_ratio(op)))
+                for op in candidates:
+                    if self.planner.process_request(RequestRes(self.id, op.name, op.input_resources, op.callback), self.res_manager) :
+                        self.current_op = op
+                        self.status = NodeState.WAITING_FOR_RESOURCE
+                        # 🔹 Лічильник замовленої продукції
+                        if op.name in self.reserved:
+                            self.reserved[op.name] += 1000 if op.name == "Type0" else 1
+                        else:
+                            self.reserved[op.name] = 1000 if op.name == "Type0" else 1
+                        break  # запускаємо лише одну операцію за цикл
         if(is_point):       
             self.memory.append(self.reliability.get(self.time_work))
             for o in self.operations:

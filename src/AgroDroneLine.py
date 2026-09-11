@@ -25,7 +25,8 @@ class SimulationComplete(Exception):
  #Клас виробничої лінії агродронів
 class AgroDroneLine:
     def __init__(self, seed: int | None = None, lim_drones_made: int = 3,
-                 T_pm_print_park: float | None = None, verbose: bool = True):
+                 T_pm_print_park: float | None = None, verbose: bool = True,
+                 n_filament_suppliers: int = 1):
         # 🎲 Сідування RNG для відтворюваності репліки: усі stats.*.rvs() у
         # Efficiency.py семплюють через глобальний numpy-стан (не отримують
         # явний random_state), тому np.random.seed() перед побудовою лінії
@@ -39,7 +40,16 @@ class AgroDroneLine:
         self.res_manager = ResourceManager() # Менеджер ресурсів лінії
         self.planner = ProductionPlanner() # Ініціалізація планувальника
         self.T_pm_print_park = T_pm_print_park  # T_pm для парку 3D-друку (вузли 2-16), None = природний розподіл
-        self.initialize_units(self.res_manager, T_pm_print_park=self.T_pm_print_park)  # Ініціалізація вузлів при створенні лінії
+        # 🔧 D9/D10: вузол 1 (постачальник філаменту) структурно не встигає за
+        # апетитом парку 3D-друку (0.556 од/с проти ~2.55 од/с при повному
+        # навантаженні парку) — незалежно від T_pm. n_filament_suppliers > 1
+        # додає паралельні копії вузла 1 (кожна — власний ProductionNode з
+        # тими самими node_params1/reliability_params1), що моделює кілька
+        # паралельних екструдерів філаменту на реальній лінії. За замовчуванням
+        # =1 — поведінка, ідентична до фіксу D9 (не ламає старі прогони).
+        self.n_filament_suppliers = n_filament_suppliers
+        self.initialize_units(self.res_manager, T_pm_print_park=self.T_pm_print_park,
+                               n_filament_suppliers=self.n_filament_suppliers)  # Ініціалізація вузлів при створенні лінії
         self.initialize_resources()    # Ініціалізація складських запасів
         self.number_drones_made = 0    # Лічильник виготовлених дронів
         self.lim_drones_made = lim_drones_made  # Ліміт на виготовлення дронів
@@ -92,27 +102,49 @@ class AgroDroneLine:
         print("📦 Ініціалізація планувальника")
         self.planner.get_state = self.get_state
         self.planner.get_reserved = self.get_reserved
+        self.planner.get_produced = self.get_produced  # D11: throttle-гейт має звірятись з РЕАЛЬНО виробленим
+        self.planner.get_defects = self.get_defects  # D15: компенсація браку від REPAIR-переривань мід-флайт
+        self.planner.get_bom_footprint = self.get_bom_footprint  # D18: наскрізний BOM-слід для нарахування браку
         for node in self.units:
             node.planner = self.planner
-   
+
     # повертає поточний статус вузла за його ID
     def get_state(self, id_node: int) -> NodeState:
         unit = next((u for u in self.units if u.id == id_node), None)
         return unit.get_status() if unit else NodeState.FAILURE
     # повертає загальну кількість ресурсів заданого типу на які існує запит усіма вузлами
+    # (замовлено, ще не обовʼязково виготовлено — див. D11, для throttle-гейту НЕ використовується)
     def get_reserved(self, resource_name: str) -> int:
-        return sum(unit.get_reserved(resource_name) for unit in self.units) 
-    #Повертає словник {ресурс: кількість}, необхідний для виготовлення одного екземпляра кінцевого продукту.
-    def getResourcesForOneDrone(self, resource_name: str) -> dict[str, int]:
-        # 🔹 Унікальні операції по назві
-        unique_operations: dict[str, dict[str, int]] = {}
+        return sum(unit.get_reserved(resource_name) for unit in self.units)
+    # D11: скільки одиниць ресурсу РЕАЛЬНО виготовлено (усіма вузлами сумарно) —
+    # саме це, а не get_reserved(), має обмежувати throttle-гейт у ProductionPlanner.
+    def get_produced(self, resource_name: str) -> int:
+        return sum(unit.get_produced(resource_name) for unit in self.units)
+    # D15: скільки одиниць цього ресурсу списано в брак по всій лінії (сумарно
+    # від REPAIR-переривань мід-флайт) — саме на цю величину throttle-гейт
+    # розширює квоту, щоб дозволити компенсуючу заміну. Див. ProductionNode._interrupt_to().
+    def get_defects(self, resource_name: str) -> int:
+        return sum(unit.get_defects(resource_name) for unit in self.units)
 
+    #Повертає словник {ресурс: кількість}, необхідний для виготовлення ОДНІЄЇ
+    # одиниці заданого ресурсу — рекурсивно, наскрізь по всьому BOM-дереву
+    # (включно з самим resource_name на множнику 1). Раніше ця логіка (unique_operations
+    # + resolve()) жила лише всередині getResourcesForOneDrone("Type22") для
+    # розрахунку квот. D18 (2026-09-11): винесено в окремий публічний метод, бо
+    # тепер вона ще й потрібна ProductionNode._interrupt_to() — щоб при перериванні
+    # операції мід-флайт нараховувати брак НАСКРІЗНО по всьому дереву сировини, що
+    # пішла на неї, а не лише на її безпосередні input_resources (див. D18 у
+    # DECISIONS.md: компенсація лише на один рівень вгору не встигала покрити
+    # реальний сукупний брак на глибоких вузлах 19-22 — лінія впиралась у
+    # вичерпання сировини Type1-15 вже ПІСЛЯ D15/D16/D17, застрягаючи, напр., на 8/10
+    # дронів за 7·10⁶с без подальшого прогресу).
+    def get_bom_footprint(self, resource_name: str) -> dict[str, int]:
+        unique_operations: dict[str, dict[str, int]] = {}
         for unit in self.units:
             for op in unit.operations:
                 if op.name not in unique_operations:
                     unique_operations[op.name] = op.input_resources
 
-        # 🔁 Рекурсивне накопичення
         def resolve(res_name: str, multiplier: int = 1, acc: dict[str, int] = None):
             if acc is None:
                 acc = {}
@@ -128,6 +160,10 @@ class AgroDroneLine:
             return acc
 
         return resolve(resource_name)
+
+    #Повертає словник {ресурс: кількість}, необхідний для виготовлення одного екземпляра кінцевого продукту.
+    def getResourcesForOneDrone(self, resource_name: str) -> dict[str, int]:
+        return self.get_bom_footprint(resource_name)
     
     def info(self) -> str:
         info_str = "Статус виробничої лінії:\n"
@@ -151,7 +187,8 @@ class AgroDroneLine:
             raise SimulationComplete(self.current_time, self.number_drones_made)
 
     # Первинна ініціалізація вузлів та операцій виробничої лінії
-    def initialize_units(self, resource_manager, T_pm_print_park: float | None = None):
+    def initialize_units(self, resource_manager, T_pm_print_park: float | None = None,
+                          n_filament_suppliers: int = 1):
 
         
         # === Розподіли ефективності ===
@@ -176,15 +213,31 @@ class AgroDroneLine:
         efficiency_params26={"productivity":1/(18*60),"utilization_rate":0.70, "integration_capability":"Так (можливе розширення тестових зон)", "scaling_potential":"Можлива при збільшенні кількості вузлів", "schedule_accuracy":(0.95,0.02),"defect_rate":(0.01,0.003),
                             "stability":(0.95,0.99),"reconfiguration_speed":10.0,"power_usage":0.78, "maintenance_cost":700.0,"profitability":0.13,"certification_compliance":0.99, "waste_generation":0.02,"environmental_efficiency":1.0}
         
-        reliability_params1={"repairability":"Середня (стандартні комплектуючі)","preservation":1.0,"longevity":9.0,"failure_frequency":(0.01,0.0001),"maintenance_interval":(1000,200,0.01),"reliability":(0.00005,0.000001),"emergency_response":0.0083}
+        # D7 (2026-09-11): maintenance_interval μ підняно з 1000 до 10000 (×10,
+        # σ пропорційно до тієї ж CV=0.2) — з μ=1000 вузол ішов на ТО раніше,
+        # ніж встигав завершити одну операцію (duration_work=1800с), паралізуючи
+        # єдиний постачальник філаменту. μ=10000 дає ~5.6 циклів роботи між ТО —
+        # орієнтовний, а не виміряний показник (джерело реальних параметрів
+        # надійності не закрито, див. README.md "Дані"); задокументовано в
+        # docs/DECISIONS.md D7 і validation/validation_reliability_params.md.
+        reliability_params1={"repairability":"Середня (стандартні комплектуючі)","preservation":1.0,"longevity":9.0,"failure_frequency":(0.01,0.0001),"maintenance_interval":(10000,2000,0.01),"reliability":(0.00005,0.000001),"emergency_response":0.0083}
         reliability_params2={"repairability":"Висока (стандартні комплектуючі, заміна екструдера)","preservation":1.0,"longevity":6.5,"failure_frequency":(0.02,0.0001),"maintenance_interval":(800,150,0.01),"reliability":(0.0001,0.000002),"emergency_response":0.0056}
         reliability_params17={"repairability":"Висока (стандартні роботизовані механізми)","preservation":1.0,"longevity":8.5,"failure_frequency":(0.015,0.0001),"maintenance_interval":(1200,250,0.01),"reliability":(0.00008,0.0000015),"emergency_response":0.0028}
         reliability_params19={"repairability":"Висока (стандартні механізми)","preservation":1.0,"longevity":8.0,"failure_frequency":(0.012,0.0001),"maintenance_interval":(1100,200,0.01),"reliability":(0.00008,0.0000015),"emergency_response":0.0033}
         reliability_params21={"repairability":"Висока (адаптивна заміна компонентів)","preservation":1.0,"longevity":7.5,"failure_frequency":(0.014,0.0001),"maintenance_interval":(1000,210,0.01),"reliability":(0.00012,0.0000025),"emergency_response":0.0042}
-        reliability_params22={"repairability":"Висока (стандартні електронні компоненти)","preservation":1.0,"longevity":8.5,"failure_frequency":(0.01,0.0001),"maintenance_interval":(1200,200,0.01),"reliability":(0.00007,0.0000012),"emergency_response":0.0028}
-        reliability_params23={"repairability":"Висока","preservation":1.0,"longevity":10.0,"failure_frequency":(0.000001,0.00000001),"maintenance_interval":(1200,200,0.01),"reliability":(0.00006,0.000001),"emergency_response":0.0028}
-        reliability_params24={"repairability":"Висока","preservation":1.0,"longevity":10.0,"failure_frequency":(0.000001,0.00000001),"maintenance_interval":(1200,200,0.01),"reliability":(0.00009,0.0000018),"emergency_response":0.0028}
-        reliability_params25={"repairability":"Середня (стандартні комплектуючі)","preservation":1.0,"longevity":8.5,"failure_frequency":(0.000001,0.00000001),"maintenance_interval":(1200,200,0.01),"reliability":(0.00005,0.000001),"emergency_response":0.0028}
+        # D7 (2026-09-11): вузли 22-25 — та сама проблема, що й вузол 1 (μ ТО
+        # коротший за duration_work власної операції: 3180/2940/2220/3600с
+        # відповідно, проти μ=1200). Піднято ×10 (μ=12000, σ пропорційно,
+        # CV≈0.167 збережено) — орієнтовний, задокументований допуск, не
+        # виміряне значення (див. D7/validation_reliability_params.md).
+        # reliability_params2 (парк 3D-друку, вузли 2-16) НАВМИСНО не чіпаємо:
+        # T_pm_print_park завжди явно задається сіткою експерименту й повністю
+        # ЗАМІНЮЄ природний maintenance_interval (див. ProductionNode._maintenance_due),
+        # тому цей параметр park-вузлів не впливає на дослідження 4.2.
+        reliability_params22={"repairability":"Висока (стандартні електронні компоненти)","preservation":1.0,"longevity":8.5,"failure_frequency":(0.01,0.0001),"maintenance_interval":(12000,2000,0.01),"reliability":(0.00007,0.0000012),"emergency_response":0.0028}
+        reliability_params23={"repairability":"Висока","preservation":1.0,"longevity":10.0,"failure_frequency":(0.000001,0.00000001),"maintenance_interval":(12000,2000,0.01),"reliability":(0.00006,0.000001),"emergency_response":0.0028}
+        reliability_params24={"repairability":"Висока","preservation":1.0,"longevity":10.0,"failure_frequency":(0.000001,0.00000001),"maintenance_interval":(12000,2000,0.01),"reliability":(0.00009,0.0000018),"emergency_response":0.0028}
+        reliability_params25={"repairability":"Середня (стандартні комплектуючі)","preservation":1.0,"longevity":8.5,"failure_frequency":(0.000001,0.00000001),"maintenance_interval":(12000,2000,0.01),"reliability":(0.00005,0.000001),"emergency_response":0.0028}
         reliability_params26={"repairability":"Середня (стандартні комплектуючі)","preservation":1.0,"longevity":8.5,"failure_frequency":(0.000001,0.00000001),"maintenance_interval":(1200,200,0.01),"reliability":(0.00004,0.0000008),"emergency_response":0.0028}
         
         op_params0={"op_name": "Type0", "description": " ", "resources": {"TypePL": 1},"duration_work": 1800, "duration_maintenance": 180}
@@ -278,6 +331,15 @@ class AgroDroneLine:
             )
 
         node_1 = make_node(node_params1, resource_manager, self.planner)
+        # 🔧 D9/D10: додаткові паралельні постачальники філаменту (Type0), якщо
+        # запитано (n_filament_suppliers > 1) — копії node_params1/reliability_params1,
+        # унікальні id 101, 102, ... (поза діапазоном 1-26, щоб не перетнутись
+        # з жодною існуючою нумерацією вузлів чи фільтром "парк 2-16").
+        extra_filament_suppliers = []
+        for i in range(2, n_filament_suppliers + 1):
+            extra_node = make_node(node_params1, resource_manager, self.planner)
+            extra_node.id = 100 + i
+            extra_filament_suppliers.append(extra_node)
         # 🔬 Вузли 2-16 — парк 3D-друку, предмет параметричного дослідження 4.2:
         # T_pm_print_park керує їхнім плановим ТО (None = природний LogNormal-розподіл)
         node_2 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
@@ -338,8 +400,8 @@ class AgroDroneLine:
             # 🔹 Додавання всіх вузлів з використанням оновлених параметрів
             node_1, node_2, node_3, node_4, node_5, node_6, node_7, node_8, node_9, node_10, node_11,
             node_12, node_13, node_14, node_15, node_16, node_17, node_18, node_19, node_20, node_21,
-            node_22, node_23, node_24, node_25, node_26     
-        ]
+            node_22, node_23, node_24, node_25, node_26
+        ] + extra_filament_suppliers  # D9/D10: додаткові постачальники філаменту (id 101+), якщо запитано
         print(f"✅ додавання вузлів завершено.")
 
     # Первинна ініціалізація ресурсів на складі
