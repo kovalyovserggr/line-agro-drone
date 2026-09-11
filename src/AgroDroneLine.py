@@ -5,20 +5,44 @@ from ProductionNode import ProductionNode, NodeState
 from Efficiency import Efficiency, Reliability, NormalDistribution, UniformDistribution, TimeDependentExponential, TimeDependentLogNormal, IncreasingParameter, DecreasingParameter, ConstantParameter
 from ProductionPlanner import ProductionPlanner
 import sys
+import numpy as np
 import matplotlib
 matplotlib.use("Agg")   # без GUI, тільки рендер у файл
 import matplotlib.pyplot as plt
 
+
+class SimulationComplete(Exception):
+    """Контрольоване завершення прогону: піднімається замість sys.exit(), щоб
+    experiments/run_parametric_study.py міг ловити завершення однієї репліки
+    і продовжувати сітку в тому самому процесі (sys.exit() зупиняв би весь
+    Python-процес після першого ж прогону)."""
+    def __init__(self, elapsed_time: float, number_drones_made: int):
+        self.elapsed_time = elapsed_time
+        self.number_drones_made = number_drones_made
+        super().__init__(f"Виготовлено {number_drones_made} дронів за {elapsed_time:.1f} с")
+
+
  #Клас виробничої лінії агродронів
 class AgroDroneLine:
-    def __init__(self):
+    def __init__(self, seed: int | None = None, lim_drones_made: int = 3,
+                 T_pm_print_park: float | None = None, verbose: bool = True):
+        # 🎲 Сідування RNG для відтворюваності репліки: усі stats.*.rvs() у
+        # Efficiency.py семплюють через глобальний numpy-стан (не отримують
+        # явний random_state), тому np.random.seed() перед побудовою лінії
+        # робить прогін повністю відтворюваним для даного seed.
+        if seed is not None:
+            np.random.seed(seed)
+        self.seed = seed
+        self.verbose = verbose         # False у батч-експерименті — прибирає підсумкові print()
+        self.current_time = 0.0        # оновлюється в tick(); потрібен для SimulationComplete
         self.units = []                # Список виробничих вузлів
         self.res_manager = ResourceManager() # Менеджер ресурсів лінії
         self.planner = ProductionPlanner() # Ініціалізація планувальника
-        self.initialize_units(self.res_manager)  # Ініціалізація вузлів при створенні лінії
+        self.T_pm_print_park = T_pm_print_park  # T_pm для парку 3D-друку (вузли 2-16), None = природний розподіл
+        self.initialize_units(self.res_manager, T_pm_print_park=self.T_pm_print_park)  # Ініціалізація вузлів при створенні лінії
         self.initialize_resources()    # Ініціалізація складських запасів
         self.number_drones_made = 0    # Лічильник виготовлених дронів
-        self.lim_drones_made = 3       # Ліміт на виготовлення дронів
+        self.lim_drones_made = lim_drones_made  # Ліміт на виготовлення дронів
         self.bind_planner_delegates()  # Прив'язка делегатів планера
         self.time_point = 1000        # Інтервал часу для запису в історію
         self.memory_points: list = []  #
@@ -117,16 +141,17 @@ class AgroDroneLine:
     def drone_made_callback(self, unit_id: int):
         self.number_drones_made += 1
         if self.number_drones_made >= self.lim_drones_made:
-            print(self.res_manager.info())
-            print(self.info())
-            print(f"🚜 Виготовлено агродрон в кількості {self.number_drones_made} штук!")
-            # кілька параметрів надійності
-            self.plot_history(node_id=2, op_name=None, keys_y=["failure_frequency", "emergency_response"])
-            
-            sys.exit()  
+            if self.verbose:
+                print(self.res_manager.info())
+                print(self.info())
+                print(f"🚜 Виготовлено агродрон в кількості {self.number_drones_made} штук!")
+                self.plot_history(node_id=2, op_name=None, keys_y=["failure_frequency", "emergency_response"])
+            # Контрольоване завершення репліки (замість sys.exit(), який зупинив би
+            # увесь процес — неприйнятно для батч-прогону сітки T_pm × N реплікацій)
+            raise SimulationComplete(self.current_time, self.number_drones_made)
 
     # Первинна ініціалізація вузлів та операцій виробничої лінії
-    def initialize_units(self, resource_manager):
+    def initialize_units(self, resource_manager, T_pm_print_park: float | None = None):
 
         
         # === Розподіли ефективності ===
@@ -235,7 +260,7 @@ class AgroDroneLine:
                 res_manager
             )
 
-        def make_node(node_params, res_manager, planner):
+        def make_node(node_params, res_manager, planner, T_pm=None):
             operations_list = [
                 make_operation(op_params, efficiency_params, res_manager)
                 for (op_params, efficiency_params) in node_params["operations"]
@@ -248,39 +273,42 @@ class AgroDroneLine:
                 duration_repair=node_params["duration_repair"],
                 operations=operations_list,
                 res_manager=res_manager,
-                planner=planner
+                planner=planner,
+                T_pm=T_pm
             )
-       
+
         node_1 = make_node(node_params1, resource_manager, self.planner)
-        node_2 = make_node(node_params2, resource_manager, self.planner)
+        # 🔬 Вузли 2-16 — парк 3D-друку, предмет параметричного дослідження 4.2:
+        # T_pm_print_park керує їхнім плановим ТО (None = природний LogNormal-розподіл)
+        node_2 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_2.id = 2
-        node_3 = make_node(node_params2, resource_manager, self.planner)
+        node_3 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_3.id = 3
-        node_4 = make_node(node_params2, resource_manager, self.planner)
+        node_4 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_4.id = 4
-        node_5 = make_node(node_params2, resource_manager, self.planner)
+        node_5 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_5.id = 5
-        node_6 = make_node(node_params2, resource_manager, self.planner)
+        node_6 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_6.id = 6
-        node_7 = make_node(node_params2, resource_manager, self.planner)
+        node_7 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_7.id = 7
-        node_8 = make_node(node_params2, resource_manager, self.planner)
+        node_8 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_8.id = 8
-        node_9 = make_node(node_params2, resource_manager, self.planner)
+        node_9 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_9.id = 9
-        node_10 = make_node(node_params2, resource_manager, self.planner)
+        node_10 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_10.id = 10
-        node_11 = make_node(node_params2, resource_manager, self.planner)
+        node_11 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_11.id = 11
-        node_12 = make_node(node_params2, resource_manager, self.planner)
+        node_12 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_12.id = 12
-        node_13 = make_node(node_params2, resource_manager, self.planner)
+        node_13 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_13.id = 13
-        node_14 = make_node(node_params2, resource_manager, self.planner)
+        node_14 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_14.id = 14
-        node_15 = make_node(node_params2, resource_manager, self.planner)
+        node_15 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_15.id = 15
-        node_16 = make_node(node_params2, resource_manager, self.planner)
+        node_16 = make_node(node_params2, resource_manager, self.planner, T_pm=T_pm_print_park)
         node_16.id = 16
         node_17 = make_node(node_params17, resource_manager, self.planner)
         node_17.id = 17
@@ -349,24 +377,22 @@ class AgroDroneLine:
                 op.res_manager = self.units[0].res_manager
 
     def tick(self, elapsed_time):
-        
+        self.current_time = elapsed_time   # потрібен drone_made_callback для SimulationComplete
+
         self.res_manager.tick()
         if elapsed_time % self.time_point == 0:
-            self.memory_points.append(elapsed_time) 
+            self.memory_points.append(elapsed_time)
             for item in self.units: # запис у історію лише раз на N тіків
                 item.tick(elapsed_time, 1)
-        else:                   
+        else:
             for item in self.units: # без запису історії
                 item.tick(elapsed_time, 0)
-            
-        if elapsed_time %  50000 == 0:
+
+        if self.verbose and elapsed_time % 50000 == 0:
             print(f"⏱️ Час: {elapsed_time:.2f} сек")
-        if elapsed_time  == 300000:
-            print(f"⏱️ Час: {elapsed_time:.2f} сек")
-            print(self.res_manager.info())
-            print(self.info())
-            
-            sys.exit()    
-            
-   
-   
+        # ПРИМІТКА: попередній жорсткий sys.exit() на elapsed_time==300000 прибрано —
+        # він тихо обрізав би будь-який прогін, чий makespan перевищує цей поріг
+        # (реалістично при поганих T_pm/реальних відмовах), спотворюючи результати
+        # параметричного дослідження. Горизонт і критерій завершення репліки тепер
+        # задає experiments/run_parametric_study.py (ліміт тіків + SimulationComplete).
+

@@ -14,19 +14,27 @@ class ProductionNode:
     def __init__(
             self,
             id: float,
-            description: str, 
+            description: str,
             reliability: Reliability,
             duration_maintenance,
             duration_repair,
             operations: list,
             res_manager: ResourceManager,
-            planner : ProductionPlanner = None
+            planner : ProductionPlanner = None,
+            T_pm: float | None = None
             ):
         self.id = id
         self.description = description
         self.reliability = reliability
         self.time_work = 0.0
         self.agentNode = None
+        # --- Параметричне дослідження (стаття 1, 4.2): T_pm — фіксований період
+        # проактивного ТО, що ЗАМІНЮЄ природний стохастичний maintenance_interval,
+        # коли задано (не None). Для вузлів поза дослідженням лишається None —
+        # ТО настає за природним розподілом self.reliability.maintenance_interval.
+        self.T_pm = T_pm
+        self.next_failure_threshold: float | None = None     # семпл з failure_frequency
+        self.next_maintenance_threshold: float | None = None  # T_pm або семпл з maintenance_interval
         self.operations = operations if operations else []
         self.status = NodeState.IDLE
         self.progress = 0.0
@@ -70,10 +78,66 @@ class ProductionNode:
         return self.producedget.get(res_name,0) 
      
     def update_status(self):
-        """Оновлює статус вузла та його операцій на основі параметрів ефективності та надійності"""
+        """Перевіряє накопичене напрацювання (self.time_work) на предмет випадкової
+        відмови. Діє лише поки вузол WORKING — у решті станів напрацювання не
+        накопичується, перевіряти нема чого.
 
-     
- 
+        Поріг self.next_failure_threshold семплюється з self.reliability.reliability
+        ("λ безвідмовності", TimeDependentExponential, λ(t) зростає з напрацюванням —
+        ефект старіння). НЕ self.reliability.failure_frequency: димовий тест
+        2026-08-31 показав, що за λ₀ з node_paramsN (напр. 0.01 для вузла 1)
+        failure_frequency дає MTBF ~100с — на два порядки коротше за тривалість однієї
+        операції (1800с+), тобто вузол ніколи не встигає нічого виготовити. За
+        узгодженням з автором (Serhii, 2026-08-31): REPAIR запускає саме reliability
+        (λ~5·10⁻⁵ → MTBF~20000с, фізично правдоподібно), а failure_frequency лишається
+        діагностичним полем — семплюється й пишеться в історію (self.memory), але на
+        FSM не впливає, як і в оригінальному коді до цих правок.
+
+        Відмова МОЖЕ перервати операцію мід-флайт — це відповідає природі непланової
+        поломки. Планове ТО (T_pm / maintenance_interval) навмисно перевіряється в
+        ІНШОМУ місці — на межі операцій (див. _maintenance_due(), викликається з IDLE
+        у tick()), а не тут: другий димовий тест 2026-08-31 показав, що для частини
+        вузлів середній природний maintenance_interval (напр. 1000с для вузла 1)
+        коротший за тривалість однієї операції (1800с) — при неперервній перевірці
+        мід-флайт вузол узагалі ніколи не завершував би жодного циклу. Це рішення я
+        прийняв самостійно (без окремого підтвердження) як інженерно необхідне для
+        працездатності лінії; варте фіксації в DECISIONS.md і перевірки, чи не
+        суперечить задуму статті."""
+        if self.status != NodeState.WORKING:
+            return
+
+        if self.next_failure_threshold is None:
+            self.next_failure_threshold = self.reliability.reliability.sample(self.time_work)
+        if self.time_work >= self.next_failure_threshold:
+            self._interrupt_to(NodeState.REPAIR)
+
+    def _maintenance_due(self) -> bool:
+        """Перевіряється на межі операцій (з IDLE, перед вибором нової), не мід-флайт.
+        Поріг: self.T_pm, якщо вузол бере участь у параметричному дослідженні 4.2,
+        інакше природний розподіл self.reliability.maintenance_interval (LogNormal)."""
+        if self.next_maintenance_threshold is None:
+            self.next_maintenance_threshold = (
+                self.T_pm if self.T_pm is not None
+                else self.reliability.maintenance_interval.sample(self.time_work)
+            )
+        return self.time_work >= self.next_maintenance_threshold
+
+    def _interrupt_to(self, new_status: NodeState):
+        """Перериває поточну операцію (якщо є) і переводить вузол у REPAIR/MAINTENANCE.
+        Перервана операція скидається в IDLE (а не лишається "підвислою" в EXECUTING),
+        щоб вузол міг коректно повернутись до неї в наступному циклі IDLE.
+        ВІДОМЕ СПРОЩЕННЯ: уже спожиті на перервану операцію ресурси (op.resourses)
+        не повертаються на склад — це прийнятний, задокументований компроміс для
+        цього дослідження (перерваних циклів відносно мало порівняно з тривалістю
+        operations 3D-друку), але його варто явно зазначити в DECISIONS.md репозиторію."""
+        if self.current_op is not None:
+            self.current_op.progress = 0.0
+            self.current_op.state = OperationState.IDLE
+            self.current_op = None
+        self.status = new_status
+        self.progress = 0.0
+        self.next_failure_threshold = None
+        self.next_maintenance_threshold = None
 
     def tick(self, current_time: float, is_point : int):
                
@@ -147,6 +211,14 @@ class ProductionNode:
                     self.status = NodeState.WORKING
 
             elif self.status == NodeState.IDLE:
+                # 🔧 Планове ТО перевіряється саме тут — на межі операцій, до вибору
+                # нової роботи (не мід-флайт, див. _maintenance_due()/update_status())
+                if self._maintenance_due():
+                    self.status = NodeState.MAINTENANCE
+                    self.progress = 0.0
+                    self.next_maintenance_threshold = None
+                    self.next_failure_threshold = None
+                    return
                 # 🔹 Аналізуємо всі операції, які вузол може виконувати
                 for op in self.operations:
                     if op.state == OperationState.IDLE: 

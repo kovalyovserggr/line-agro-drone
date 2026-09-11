@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "Якщо використовуєте цей код, будь ласка, цитуйте його так:"
+title: "line-agro-drone: data-driven simulation model of an agricultural drone production line"
+authors:
+  - family-names: "Kovalov"
+    given-names: "Serhii"
+    email: "kovalyovserggr@ukr.net"
+    affiliation: "Central Ukrainian National Technical University"
+version: 0.1.0
+date-released: 2026-09-11
+license: MIT
+repository-code: "https://github.com/kovalyovserggr/line-agro-drone"
